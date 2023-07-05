@@ -1,0 +1,809 @@
+---
+title: "Predictive Analytics Class Project Phase 2"
+format: md
+editor: visual
+---
+
+# Ames, Iowa: Which characteristics predict if a home will sell above or below the median home value?
+
+## Set-Up & Selection
+
+```{r libraries}
+library(tidyverse) 
+library(tidymodels)
+library(glmnet) #for Lasso, ridge, and elastic net models 
+library(GGally) #create ggcorr and ggpairs plots
+library(ggcorrplot) #create an alternative to ggcorr plots
+library(MASS) #access to forward and backward selection algorithms
+library(leaps) #best subset selection
+library(lmtest) #for the dw test
+library(splines) #for nonlinear fitting
+library(e1071) 
+library(ROCR)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+library(rattle)
+library(gridExtra)
+library(vip)
+library(ranger)
+library(usemodels)
+```
+
+Above I have loaded in the required packages. Then I load in the ames dataset.
+
+```{r importing ames}
+ames = read_csv("ames_student-1.csv")
+```
+
+First I mutate ames to convert character variables to factors.
+
+```{r converting character variables to factors }
+ames=
+  ames%>%
+  mutate_if(is.character,as_factor)
+```
+
+Next I check that our response variable, Above_Median, is ordered correctly so that our negative response is first.
+
+```{r response variable order}
+levels(ames$Above_Median)
+ames = ames %>% mutate(Above_Median = fct_relevel(Above_Median, c("No","Yes")))
+levels(ames$Above_Median)
+```
+
+Then I look at the summary for the ames set. My aim to eliminate variables that have low variance, or may be heavily skewed one way or another.
+
+```{r summary of ames}
+summary(ames)
+
+#looking at these results, to decide which variables to remove or slim down
+```
+
+I also look at correlation between our predictor variables. To avoid multicollinearity, I want to observe and remove any predictor variables with correlation with one another.
+
+```{r looking at corr plots}
+amescorr1 = ames %>%
+  dplyr::select(
+    Lot_Frontage,
+    Lot_Area,
+    Year_Built,
+    Year_Remod_Add,
+    Mas_Vnr_Area,
+    BsmtFin_SF_1,
+    BsmtFin_SF_2,
+    Bsmt_Unf_SF,
+    Total_Bsmt_SF
+  )
+
+amescorr2 = ames %>%
+  dplyr::select(
+    First_Flr_SF,
+    Second_Flr_SF,
+    Low_Qual_Fin_SF,
+    Gr_Liv_Area,
+    Bsmt_Full_Bath,
+    Bsmt_Half_Bath,
+    Full_Bath,
+    Half_Bath,
+    Bedroom_AbvGr,
+    Kitchen_AbvGr,
+    TotRms_AbvGrd,
+    Fireplaces,
+    Garage_Cars,
+    Garage_Area,
+  )
+
+amescorr3 = ames %>%
+  dplyr::select(
+    Wood_Deck_SF,
+    Open_Porch_SF,
+    Enclosed_Porch,
+    Three_season_porch,
+    Screen_Porch,
+    Pool_Area,
+    Misc_Val,
+    Year_Sold,
+    Mo_Sold,
+    Year_Built,
+    Longitude,
+    Latitude
+  )
+
+ggcorr(ames)
+ggcorr(amescorr1)
+ggcorr(amescorr2)
+ggcorr(amescorr3)
+```
+
+With this information in mind, I remove variables from the Ames dataset. I selected these based on graphical representation of the variable vs. the response variable, variance, and strong co-linearity with other predictor variables. This set had a lot of significant multicollinearity for example, Garage Area and Garage Cars were strongly correlated, so I removed Garage Area. Ground Living Area was correlated with many variables, such as Total Rooms Above Ground, Second Floor Square Footage, and First Floor Square Footage. Other variables, such as Heating QC had poor variance, with a massively larger count of one level than the others. This would interfere with the model and needed removal. Some variables graphically demonstrated no relationship or a poor relationship with Above_Median, such as Overall Condition, and were removed due to this.
+
+```{r removing predictor variables}
+
+ames_cleaned = ames %>%
+  dplyr::select(
+    -Street, 
+    -Alley, 
+    -Utilities, 
+    -Lot_Config,
+    -Land_Slope, 
+    -Land_Contour,
+    -Condition_1,
+    -Condition_2, 
+    -Roof_Style,
+    -Roof_Matl,
+    -BsmtFin_Type_1, 
+    -BsmtFin_SF_1,
+    -BsmtFin_Type_2,
+    -BsmtFin_SF_2,
+    -Bsmt_Cond,
+    -Bsmt_Exposure,
+    -Bsmt_Unf_SF,
+    -Bsmt_Qual,
+    -Heating, 
+    -Electrical, 
+    -Functional, 
+    -Heating_QC, 
+    -Fence, 
+    -Garage_Cond,
+    -Garage_Qual,
+    -Garage_Finish,
+    -Functional,
+    -Misc_Feature,
+    -Sale_Type,
+    -Pool_QC,
+    -Lot_Frontage,
+    -Bldg_Type,
+    -Overall_Cond,
+    -First_Flr_SF,
+    -Second_Flr_SF,
+    -Low_Qual_Fin_SF,
+    -Wood_Deck_SF,
+    -Open_Porch_SF,
+    -Enclosed_Porch,
+    -Three_season_porch,
+    -Screen_Porch,
+    -Wood_Deck_SF,
+    -Mas_Vnr_Area,
+    -Bsmt_Full_Bath,
+    -Bsmt_Half_Bath,
+    -Year_Remod_Add,
+    -Paved_Drive,
+    -Fireplaces,
+    -Fireplace_Qu,
+    -Mas_Vnr_Type,
+    -Exterior_2nd,
+    -Garage_Area, 
+    -TotRms_AbvGrd, 
+    -Year_Remod_Add, 
+    -Bedroom_AbvGr, 
+    -Longitude,
+    -Latitude,
+    -Exterior_1st,
+    -Exter_Qual)
+
+```
+
+Now it's time to build our models. I start by splitting the data into a training set and a testing set with strata set as Above_Median.
+
+```{r splitting ames}
+#Splitting into a training and testing set. We will build the models off of the training set and then test their accuracy on the testing set. Setting Above_Median as strata guarantees a distribution in both sets centered around the response variable.
+
+set.seed(123) 
+ames_cleaned_split = initial_split(ames_cleaned, prop = 0.70, strata = Above_Median)
+train = training(ames_cleaned_split)
+test = testing(ames_cleaned_split)
+```
+
+## Logistic Regression Model
+
+Next I construct the logistic regression model. I chose logistic regression due to the binary nature of the response variable, Above_Median. I use step_other for variables that have levels of smaller count. This will improve the model by avoiding excessive dummy variables for less-frequent levels. It will condense these less-frequent levels into an "other" category. I use step_dummy to prepare factor variables into a numeric representation to enable machine modeling.
+
+```{r log model}
+
+#Setting up the logistic regression model
+ames_log_model =
+  logistic_reg(mode="classification")%>%
+  set_engine("glm")
+
+#recipe for log reg using step_other to condense and step_dummy to set our factor variables as such
+ames_log_recipe = recipe(Above_Median~.,train)%>%
+  step_other(MS_SubClass, threshold = 0.01) %>%
+  step_other(Neighborhood, threshold = 0.01) %>%
+  step_other(Overall_Qual, threshold = 0.01) %>%
+  step_other(Kitchen_Qual, threshold = 0.01) %>%
+  step_other(House_Style, threshold = 0.01) %>%
+  step_dummy(all_nominal(),-all_outcomes())
+
+#combining together recipe and model
+logreg_wf=workflow()%>%
+  add_recipe(ames_log_recipe)%>%
+  add_model(ames_log_model)
+
+#fitting the model
+ames_log_fit = fit(logreg_wf, train)
+
+#summarizing the results of our model
+summary(ames_log_fit$fit$fit$fit)
+```
+
+My model has an AIC of 559.19. By itself this does not necessarily mean much. However, if we were to add or subtract variables from the model, I could use the AIC to compare the quality of the model. A lower AIC is considered to be an increase in quality.
+
+From our model we can see which variables are significant in the determining the probability of a home selling above or below the median home value. Most appear to follow a logical pattern, but I am not content with House Style and Overall Quality. House Style's negative coefficient for Two Story appears to be in direct contract with MS_Subclass's positive coefficient for Two Story 1946 and Newer. Furthermore, House Style contradicts the visualization I performed in the preliminary descriptive data analysis.
+
+With this in mind I will continue to assess the performance of this model. I will use accuracy, sensitivity, specificity, and AUC to determine model quality on both the training and testing sets.
+
+```{r ROCR, AUC, accuracy - train}
+#Developing predictions
+predictions = predict(ames_log_fit, train, type="prob")
+head(predictions)
+
+#ROCR plot
+predictions = predict(ames_log_fit, train, type="prob")[2] #extracting the "yes" prediction
+ROCRpred = prediction(predictions, train$Above_Median)
+ROCRperf = performance(ROCRpred, "tpr", "fpr")
+plot(ROCRperf, colorize=TRUE, print.cutoffs.at=seq(0,1,by=0.1), text.adj=c(-0.2,1.7))
+
+#AUC
+as.numeric(performance(ROCRpred, "auc")@y.values)
+
+#balance sensitivity & specificity - cut off/threshold
+opt.cut = function(perf, pred){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+            cutoff = p[[ind]])
+    }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+print(opt.cut(ROCRperf, ROCRpred))
+
+```
+
+From this, we have an AUC of 0.9895119. The closer an AUC is to 1, the better.
+
+```{r confusion matrix - train}
+#I then use the cutoff value found from ROCR and used this to create a confusion matrix and pinpoint the accuracy of my model with this cutoff.
+
+t1 = table(train$Above_Median,predictions > 0.5606287)
+t1
+(t1[1,1]+t1[2,2])/nrow(train)
+
+```
+
+The accuracy of the model on the training set with a cut off of 0.5606287 is 0.946112.
+
+Next we will check the accuracy of the model on the testing set.
+
+```{r ROCR, AUC, accuracy for test}
+#Developing predictions
+predictions2 = predict(ames_log_fit, test, type="prob")
+head(predictions2)
+
+#ROCR plot
+predictions2 = predict(ames_log_fit, test, type="prob")[2] #extracting the "yes" prediction
+ROCRpred = prediction(predictions2, test$Above_Median)
+ROCRperf = performance(ROCRpred, "tpr", "fpr")
+plot(ROCRperf, colorize=TRUE, print.cutoffs.at=seq(0,1,by=0.1), text.adj=c(-0.2,1.7))
+
+#AUC
+as.numeric(performance(ROCRpred, "auc")@y.values)
+
+#balance sensitivity & specificity - cut off/threshold
+opt.cut = function(perf, pred){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+            cutoff = p[[ind]])
+    }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+print(opt.cut(ROCRperf, ROCRpred))
+
+```
+
+AUC for the testing set is 0.9512121. This is lower than on the training set but is still very close to 1. The cutoff for the model on the testing set is 0.3447664. The sensitivity is 0.9105431 and specificity is 0.8844884.
+
+```{r confusion matrix - test}
+t2 = table(test$Above_Median,predictions2 > 0.3447664)
+t2
+(t2[1,1]+t2[2,2])/nrow(test)
+```
+
+Here we can see the accuracy on the testing set to be 0.8961039.
+
+## Logistic Regression with Lasso
+
+While the previous logistic regression had good accuracy, sensitivity, and specificity, I was not content with all of the variable coefficients. I decided to trial a lasso logistic regression to see if the model can be improved.
+
+```{r seed and folds}
+set.seed(123)
+folds=vfold_cv(train,v=5) 
+```
+
+```{r use models}
+#use models generates a code template.
+use_glmnet(formula = Above_Median~., data = train)
+```
+
+```{r log reg with lasso formula}
+
+#I modified the usemodels template for glmnet by including step_other and step_dummy for the same purposes in the previous logistic regression. I also included step_normalize to scale and center the variables as required by lasso regressions.
+
+glmnet_recipe <- 
+  recipe(formula = Above_Median ~ ., data = train) %>% 
+  step_other(MS_SubClass, threshold = 0.01) %>%
+  step_other(MS_Zoning, threshold = 0.01) %>%
+  step_other(Exter_Cond, threshold = 0.01) %>%
+  step_other(Neighborhood, threshold = 0.01) %>%
+  step_other(Overall_Qual, threshold = 0.01) %>%
+  step_other(Kitchen_Qual, threshold = 0.05) %>% #I had to increase the threshold on Kitchen Quality to avoid variance issues by capturing the "other" categories
+  step_other(House_Style, threshold = 0.01) %>%
+  step_dummy(all_nominal(), -all_outcomes())%>%
+  step_normalize(all_predictors(), -all_nominal())
+
+glmnet_spec <- 
+  logistic_reg(penalty = tune(), mixture = 1) %>% #mixture of 1 to trigger lasso (as opposed to 0 would trigger ridge)
+  set_mode("classification") %>% 
+  set_engine("glmnet") 
+
+glmnet_workflow <- 
+  workflow() %>% 
+  add_recipe(glmnet_recipe) %>% 
+  add_model(glmnet_spec) 
+
+glmnet_grid = grid_regular(penalty(), levels = 100)
+
+#Using mean log loss for our lambda metric to generate probabilities.
+glmnet_tune =
+  tune_grid(glmnet_workflow, resamples = folds, 
+            grid = glmnet_grid, metrics = metric_set(mn_log_loss))
+```
+
+Next I will take this model and plot penalty vs mean of log loss. I want to try to find the optimal penalty value in order to be closest
+
+```{r penalty value v mean log loss plot}
+glmnet_tune %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  theme(legend.position = "none") 
+```
+
+Zooming in on this penalty value peak.
+
+```{r penalty value v mean log loss zoomed in}
+glmnet_tune %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  theme(legend.position = "none") +
+  xlim(0,0.1)
+```
+
+This appears to peak very close to 0.000-0.005. Next I can extract this best value for mean of log loss.
+
+```{r best penalty}
+best_mnlog = glmnet_tune %>%
+  select_best("mn_log_loss")
+best_mnlog
+```
+
+Our ideal penalty value is thus 0.003764936.
+
+```{r finalize workflow with the best min log loss value}
+final_lasso = glmnet_workflow %>% finalize_workflow(best_mnlog)
+lasso_fit = fit(final_lasso, train)
+```
+
+```{r looking at our coefficients}
+tidy(lasso_fit)
+```
+
+The coefficients for the lasso logistic regression appear more in line with logical expectations than the logistic regression alone. But how is the model performing? I will look at thresholds for this model.
+
+```{r predictions and ROCR - train}
+#generating our predictions based on the model
+predictions = predict(lasso_fit, train, type="prob")[2]
+
+#generating the ROC
+ROCRpred = prediction(predictions, train$Above_Median) 
+ROCRperf = performance(ROCRpred, "tpr", "fpr")
+plot(ROCRperf, colorize=TRUE, print.cutoffs.at=seq(0,1,by=0.1), text.adj=c(-0.2,1.7))
+
+#AUC
+as.numeric(performance(ROCRpred, "auc")@y.values)
+
+#balance sensitivity & specificity - cut off/threshold
+opt.cut = function(perf, pred){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+            cutoff = p[[ind]])
+    }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+print(opt.cut(ROCRperf, ROCRpred))
+```
+
+For this model on the training set, the sensitivity is 0.9315068, specificity is 0.9405941, and AUC is 0.9853888. Let's use the cutoff value to find the accuracy.
+
+```{r confusion matrix for train}
+t3 = table(train$Above_Median,predictions > 0.5121469)
+t3
+(t3[1,1]+t3[2,2])/nrow(train)
+```
+
+This model has an accuracy of 0.93528118 on the training set.
+
+```{r predictions and ROCR - test}
+#generating our predictions based on the model
+predictions = predict(lasso_fit, test, type="prob")[2]
+
+#generating the ROC
+ROCRpred = prediction(predictions, test$Above_Median) 
+ROCRperf = performance(ROCRpred, "tpr", "fpr")
+plot(ROCRperf, colorize=TRUE, print.cutoffs.at=seq(0,1,by=0.1), text.adj=c(-0.2,1.7))
+
+#AUC
+as.numeric(performance(ROCRpred, "auc")@y.values)
+
+#balance sensitivity & specificity - cut off/threshold
+opt.cut = function(perf, pred){
+    cut.ind = mapply(FUN=function(x, y, p){
+        d = (x - 0)^2 + (y-1)^2
+        ind = which(d == min(d))
+        c(sensitivity = y[[ind]], specificity = 1-x[[ind]], 
+            cutoff = p[[ind]])
+    }, perf@x.values, perf@y.values, pred@cutoffs)
+}
+print(opt.cut(ROCRperf, ROCRpred))
+```
+
+For this model on the testing set, the AUC is 0.9695378, sensitivity is 0.9329073, and specificity is 0.8943894. All of these out-perform the previous logistic regression on the testing set (0.9512121 AUC, sensitivity 0.9105431 and specificity 0.8844884). We will use the cut-off value to see if it out-performs with accuracy as well.
+
+```{r confusion matrix for test}
+t4 = table(test$Above_Median,predictions > 0.3949216)
+t4
+(t4[1,1]+t4[2,2])/nrow(test)
+```
+
+On the testing set the logistic lasso regression has an accuracy of 0.913961. This out-performs the previous logistic regression (accuracy on testing set of 0.8961039).
+
+Overall, the logistic lasso regression out-performs the previous logistic regression without lasso when applied to the testing set for both AUC and accuracy. Furthermore, the coefficients generated make more logical sense and correspond with the previous descriptive analysis.
+
+## Classification Tree
+
+Classification trees are decision trees that allow predictions to be made based off of the interaction between variables. I first built a simple classification tree off of the training set.
+
+```{r simple class tree}
+
+#Building the tree
+ames_classtree_recipe = recipe(Above_Median~., train)
+
+tree_model = decision_tree() %>% 
+  set_engine("rpart", model = TRUE) %>%
+  set_mode("classification")
+
+ames_classtree_wflow = 
+  workflow() %>% 
+  add_model(tree_model) %>% 
+  add_recipe(ames_classtree_recipe)
+
+ames_classtree_fit = fit(ames_classtree_wflow, train)
+
+#tree fit
+tree = ames_classtree_fit %>% 
+  pull_workflow_fit() %>% 
+  pluck("fit")
+```
+
+```{r visualizing the tree}
+fancyRpartPlot(tree, tweak=0.75)
+```
+
+The tree looks alright, if a bit difficult to read. Next I need to assess the accuracy of the tree. I do this using a confusion matrix.
+
+```{r confusion matrix simple classification tree}
+#Confusion matrix for the simple tree
+treepred = predict(ames_classtree_fit, train, type = "class")
+head(treepred)
+confusionMatrix(treepred$.pred_class,train$Above_Median,positive="Yes")
+```
+
+The initial tree is not too bad. I have a sensitivity of 0.8699, specificity of 0.9250, and accuracy of 0.8974. However, I'm wondering if I can improve these.
+
+On the training set this tree has an accuracy of 0.8970, sensitivity of 0.8699, and specificity of 0.9250. I want to see how this performs on the testing set.
+
+```{r confusion matrix class tree test}
+treepred = predict(ames_classtree_fit, test, type = "class")
+head(treepred)
+confusionMatrix(treepred$.pred_class,test$Above_Median,positive="Yes")
+```
+
+On the testing set, this tree has an accuracy of 0.8653, sensitivity of 0.8498, and specificity of 0.8812.
+
+I want to improve this tree. To maximize the accuracy of my classification tree, I want to find the most optimal complexity parameter, or 'cp' value. I am going to have R do this for me.
+
+```{r deriving the best tree}
+set.seed(123) #Specifies randomness to makes sure the randomness in the code will generate the same results.
+folds=vfold_cv(train,v=5) #5-fold cross-validation on the training data
+
+#Recipe for the tree
+ames_classtree2_recipe = recipe(Above_Median~., train) %>%
+  step_dummy(all_nominal(),-all_outcomes())
+
+#Model for the tree
+ames_classtree2_model = decision_tree(cost_complexity = tune()) %>% 
+  set_engine("rpart", model = TRUE) %>%
+  set_mode("classification")
+
+#This specifies that we are looking for 
+tree_grid = grid_regular(cost_complexity(),
+                          levels = 25)
+
+#Workflow for the tree
+ames_tree2_wflow = 
+  workflow() %>% 
+  add_model(ames_classtree2_model) %>% 
+  add_recipe(ames_classtree2_recipe)
+
+#Will gather information on evaluation metrics after tuning
+tree_res = 
+  ames_tree2_wflow %>% 
+  tune_grid(
+    resamples = folds,
+    grid = tree_grid
+    )
+
+tree_res
+
+#This will extract metrics from our plotted cost complexity
+tree_res %>%
+  collect_metrics() %>%
+  ggplot(aes(cost_complexity, mean)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) 
+
+#Creates the best tree from the most optimal accuracy measurement
+
+best_tree = tree_res %>%
+  select_best("accuracy")
+
+best_tree
+```
+
+With the optimal accuracy and cp value captured in "best_tree" object I can now plot the tree.
+
+```{r best tree set up and visualization}
+#Workflow for the new tree with the best_tree object
+final_classtree_wf = 
+  ames_tree2_wflow %>% 
+  finalize_workflow(best_tree)
+
+#Fitting
+final_fit = fit(final_classtree_wf, train)
+
+tree2 = final_fit %>% 
+  pull_workflow_fit() %>% 
+  pluck("fit")
+
+```
+
+```{r visualizing the tree part 2}
+fancyRpartPlot(tree2, tweak = 1.25) 
+```
+
+Immediately, it's notable that this tree has different variables included than the original tree.
+
+```{r best tree confusion matrix}
+treepred = predict(final_fit, train, type = "class")
+head(treepred)
+confusionMatrix(treepred$.pred_class,train$Above_Median,positive="Yes")
+```
+
+The new confusion matrix shows an improved accuracy of 0.9068. Sensitivity declined slightly to 0.9041 but Specificity increased to 0.9095. Overall this new tree has improved accuracy and specificity on the training. set.
+
+Now we will look at how this tree performs on the testing set.
+
+```{r tree on testing set}
+treepred = predict(final_fit, test, type = "class")
+head(treepred)
+confusionMatrix(treepred$.pred_class,test$Above_Median,positive="Yes")
+```
+
+On the testing set we see an accuracy of 0.8847, sensitivity of 0.8722, and specificity of 0.8977. This is also improved from the previous tree.
+
+## Random Forests
+
+```{r random forest set up}
+#recipe
+ames_rf_recipe = recipe(Above_Median~., train) %>%
+  step_dummy(all_nominal(), -all_outcomes())
+
+#model
+rf_model = rand_forest() %>% 
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("classification")
+
+#putting it all together
+ames_rf_wflow = 
+  workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(ames_rf_recipe)
+
+set.seed(123)
+#fit model to the training set
+ames_rf_fit = fit(ames_rf_wflow, train)
+```
+
+Now that the random tree is set, I want to see how it performs on the testing and training sets.
+
+```{r random forest predictions & confusion matrix - train}
+trainpredrf = predict(ames_rf_fit, train)
+head(trainpredrf)
+
+confusionMatrix(trainpredrf$.pred_class, train$Above_Median, 
+                positive = "Yes")
+```
+
+On the training set, it has an accuracy of 0.9861, sensitivity of 0.9890, and specificity of 0.9830.
+
+```{r random forest predictions & confusion matrix - test}
+testpredrf = predict(ames_rf_fit, test)
+head(testpredrf)
+confusionMatrix(testpredrf$.pred_class, test$Above_Median, 
+                positive = "Yes")
+```
+
+On the testing set, it has an accuracy of 0.9091, sensitivity of 0.8818, and specificity of 0.9373.
+
+```{r saving, loading, visualizing the model for variable importance}
+saveRDS(ames_rf_fit, "ames_rf_fit.rds")
+ames_rf_fit = readRDS("ames_rf_fit.rds")
+ames_rf_fit %>% pull_workflow_fit() %>% vip(geom = "point")
+```
+
+Our chart of variable importance was informative. It should be noted that this chart does not discriminate between above or below median home value sale.
+
+## Conclusions
+
+Overall, these four different approaches yielded acceptable models. We can compare their performances in this table. The top performers on the testing set are in bold.
+
++-------------+------------------+---------------------+---------------+--------------------------------------------------------------------------------------------------------+
+|             |                  |                     |               | logistic Regression \| logistic Lasso Regression \| Classification/ Decision Tree \| Random Forests \| |
++=============+==================+=====================+===============+========================================================================================================+
+| Accuracy    | Train: 0.946112  | Train: 0.93528118   | Train: 0.9068 | Train: 0.9861                                                                                          |
+|             |                  |                     |               |                                                                                                        |
+|             | Test: 0.8961039  | **Test: 0.913961**  | Test: 0.8847  | Test: 0.9091                                                                                           |
++-------------+------------------+---------------------+---------------+--------------------------------------------------------------------------------------------------------+
+| Sensitivity | Train: 0.9383562 | Train: 0.9315068    | Train: 0.9041 | Train: 0.9890                                                                                          |
+|             |                  |                     |               |                                                                                                        |
+|             | Test: 0.9105431  | **Test: 0.9329073** | Test: 0.8722  | Test: 0.8818                                                                                           |
++-------------+------------------+---------------------+---------------+--------------------------------------------------------------------------------------------------------+
+| Specificity | Train: 0.9561528 | Train: 0.9405941    | Train: 0.9095 | Train: 0.9830                                                                                          |
+|             |                  |                     |               |                                                                                                        |
+|             | Test: 0.8844884  | Test: 0.8943894     | Test: 0.8977  | **Test: 0.9373**                                                                                       |
++-------------+------------------+---------------------+---------------+--------------------------------------------------------------------------------------------------------+
+| AUC         | Train: 0.9895119 | Train: 0.9853888    | n/a           | n/a                                                                                                    |
+|             |                  |                     |               |                                                                                                        |
+|             | Test: 0.9512121  | **Test: 0.9695378** |               |                                                                                                        |
++-------------+------------------+---------------------+---------------+--------------------------------------------------------------------------------------------------------+
+
+The logistic lasso regression had the best performance on the testing set in accuracy, sensitivity, and AUC. The random forest had the best performance on the testing set in specificity.
+
+For ease of reference, I extracted the coefficient data from the logistic lasso regression and plugged them into Excel. I removed the excluded variables and ordered by coefficient strength both positively and negatively. Recall the strength of a coefficient is determined by how close its absolute value is to 1.
+
+|                                          |                |
+|------------------------------------------|----------------|
+| **Variable**                             | **Coefficent** |
+| Gr_Liv_Area                              | 1.332043       |
+| Overall_Qual_Very_Good                   | 0.935834       |
+| Garage_Cars                              | 0.66009        |
+| Total_Bsmt_SF                            | 0.633479       |
+| Full_Bath                                | 0.476946       |
+| Overall_Qual_Good                        | 0.440551       |
+| Foundation_PConc                         | 0.437148       |
+| MS_Zoning_Floating_Village_Residential   | 0.416718       |
+| (Intercept)                              | 0.328013       |
+| Neighborhood_Crawford                    | 0.311684       |
+| Year_Built                               | 0.263913       |
+| Neighborhood_Clear_Creek                 | 0.235276       |
+| Neighborhood_Timberland                  | 0.224135       |
+| Sale_Condition_Alloca                    | 0.215948       |
+| Kitchen_Qual_Excellent                   | 0.182781       |
+| Kitchen_Qual_Good                        | 0.170933       |
+| MS_SubClass_Split_or_Multilevel          | 0.14732        |
+| Half_Bath                                | 0.122338       |
+| MS_SubClass_Two_Story_1946_and_Newer     | 0.115926       |
+| Neighborhood_Gilbert                     | 0.112638       |
+| Neighborhood_Northwest_Ames              | 0.098113       |
+| Neighborhood_Mitchell                    | 0.080147       |
+| Exter_Cond_other                         | 0.079037       |
+| Misc_Val                                 | 0.077807       |
+| House_Style_SFoyer                       | 0.07774        |
+| Lot_Area                                 | 0.076459       |
+| House_Style_Two_and_Half_Unf             | 0.064444       |
+| Garage_Type_BuiltIn                      | 0.04681        |
+| Neighborhood_Brookside                   | 0.039986       |
+| Garage_Type_Basment                      | 0.037168       |
+| Neighborhood_Iowa_DOT_and_Rail_Road      | 0.032858       |
+| MS_SubClass_One_Story_PUD_1946_and_Newer | 0.013008       |
+| Exter_Cond_Good                          | 0.006206       |
+| Year_Sold                                | -0.01111       |
+| Foundation_Wood                          | -0.01618       |
+| Neighborhood_Sawyer_West                 | -0.01686       |
+| Foundation_Slab                          | -0.02186       |
+| Lot_Shape_Regular                        | -0.08793       |
+| Kitchen_Qual_other                       | -0.12375       |
+| Exter_Cond_Fair                          | -0.14993       |
+| Central_Air_N                            | -0.15413       |
+| MS_Zoning_Residential_Medium_Density     | -0.17407       |
+| Neighborhood_Old_Town                    | -0.19252       |
+| Overall_Qual_Fair                        | -0.21114       |
+| Garage_Type_CarPort                      | -0.21228       |
+| Sale_Condition_Family                    | -0.22482       |
+| Overall_Qual_Average                     | -0.25063       |
+| Sale_Condition_Abnorml                   | -0.29358       |
+| MS_SubClass_other                        | -0.32032       |
+| Garage_Type_Detchd                       | -0.33815       |
+| MS_SubClass_Two_Story_PUD_1946_and_Newer | -0.43284       |
+| Overall_Qual_Below_Average               | -0.49515       |
+| Kitchen_AbvGr                            | -0.77021       |
+
+Let's also revisit our random forests variable importance and decision tree.
+
+```{r tree and forest}
+saveRDS(ames_rf_fit, "ames_rf_fit.rds")
+ames_rf_fit = readRDS("ames_rf_fit.rds")
+ames_rf_fit %>% pull_workflow_fit() %>% vip(geom = "point")
+fancyRpartPlot(tree2, tweak = 1.25) 
+```
+
+Considering these three models, for home investors in Ames, Iowa, I have the following recommendations:
+
+[Prioritize]{.underline} investments in homes with the following features and characteristics:
+
+-   Larger ground living area
+
+-   Newer builds
+
+-   Large basements
+
+-   Large/more-car garages
+
+-   More full baths
+
+-   Good overall quality
+
+-   Concrete foundation
+
+-   Floating Village Residential-zoned homes
+
+-   Homes in the Crawford Neighborhood
+
+[Avoid]{.underline} investing in homes with the following features:
+
+-   More than 1 kitchen
+
+-   Detached or carport garages
+
+-   Fair, average, or below average overall quality
+
+-   Two story planned unit development homes
+
+-   Family or abnormal sale conditions
